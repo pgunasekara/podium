@@ -2,9 +2,9 @@ use super::DocumentSchema;
 use super::Indexer;
 use crate::contracts::file_to_process::FileToProcess;
 use crate::error_adapter::log_and_return_error_string;
-use anyhow::{Context, Result};
-use std::ffi::OsStr;
-use std::path::Path;
+use anyhow::{Context, Error, Result};
+use std::ffi::{OsStr, OsString};
+use tracing::{span, Level};
 
 use pdf_extract::*;
 use regex::Regex;
@@ -16,25 +16,40 @@ impl Indexer for PdfIndexer {
         extension == OsStr::new("pdf")
     }
 
+    fn supported_extensions(&self) -> Vec<OsString> {
+        vec![OsString::from("pdf")]
+    }
+
     fn index_file(&self, file_to_process: &FileToProcess) -> Result<DocumentSchema> {
-        // TODO: the resulting string from this is poorly extracted
-        // better than nothing but it should be fixed
-        let res = extract_text(&file_to_process.path).with_context(|| {
-            log_and_return_error_string(format!(
-                "pdf_indexer: Failed to extract text from pdf at path: {:?}",
-                file_to_process.path
-            ))
-        })?;
+        let path = file_to_process.path.to_str().unwrap();
+        span!(Level::INFO, "pdf_indexer: indexing pdf file", path).in_scope(|| {
+            let res = span!(Level::INFO, "pdf_indexer: Loading from disk and processing")
+                .in_scope(|| {
+                    // TODO: the resulting string from this is poorly extracted
+                    // better than nothing but it should be fixed
+                    extract_text(&file_to_process.path).with_context(|| {
+                        log_and_return_error_string(format!(
+                            "pdf_indexer: Failed to extract text from pdf at path: {:?}",
+                            file_to_process.path
+                        ))
+                    })
+                })?;
 
-        // THIS IS A BAD HACK
-        let re = Regex::new(r"\b ").with_context(|| {
-            log_and_return_error_string(format!("pdf_indexer: Failed to create regex"))
-        })?;
-        let clean = re.replace_all(&res, "").to_string();
+            let clean = span!(Level::INFO, "pdf_indexer: Processing file").in_scope(
+                || -> Result<String, Error> {
+                    // THIS IS A BAD HACK
+                    let re = Regex::new(r"\b ").with_context(|| {
+                        log_and_return_error_string(format!("pdf_indexer: Failed to create regex"))
+                    })?;
 
-        Ok(DocumentSchema {
-            name: String::new(),
-            body: clean,
+                    Ok(re.replace_all(&res, "").to_string())
+                },
+            )?;
+
+            Ok(DocumentSchema {
+                name: String::new(),
+                body: clean,
+            })
         })
     }
 }
@@ -42,12 +57,15 @@ impl Indexer for PdfIndexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contracts::file_to_process::new_file_to_process;
 
-    #[test]
-    fn test_indexing_pdf_file() {
+    use std::path::Path;
+
+    #[tokio::test(core_threads = 1)]
+    async fn test_indexing_pdf_file() {
         let test_file_path = Path::new("./test_files/Cats.pdf");
         let indexed_document = PdfIndexer
-            .index_file(&FileToProcess::from(test_file_path))
+            .index_file(&new_file_to_process(test_file_path).await)
             .unwrap();
 
         assert_eq!(indexed_document.name, "");

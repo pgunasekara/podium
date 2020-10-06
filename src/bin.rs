@@ -1,36 +1,49 @@
-use std::thread;
-
 extern crate podium_lib;
-use podium_lib::contracts::AppState::*;
-use podium_lib::query_executor::QueryResponse;
+use podium_lib::config::{get_config, AppConfig};
+use podium_lib::contracts::app_state::*;
 use podium_lib::routes::search;
-use podium_lib::tantivy_process::start_tantivy;
-
-#[macro_use]
-extern crate log;
+use podium_lib::tantivy_process::{start_tantivy, tantivy_init, TantivyConfig};
 
 use std::io;
 
 use actix_cors::Cors;
-use actix_web::{http, middleware, web, App, HttpRequest, HttpResponse, HttpServer};
-use crossbeam::channel::{unbounded, Receiver, Sender};
+use actix_web::{web, App, HttpServer};
+use app_dirs::*;
+use tracing::info;
+use tracing_subscriber::{fmt, layer::SubscriberExt, prelude::*, registry::Registry};
 
-#[actix_rt::main]
+use std::{fs::File, io::BufWriter};
+use tracing_flame::FlameLayer;
+
+const APP_INFO: AppInfo = AppInfo {
+    name: "Podium",
+    author: "Teodor Voinea",
+};
+
+#[tokio::main]
 async fn main() -> io::Result<()> {
-    simple_logger::init().unwrap();
-    let (query_tx, query_rx): (Sender<String>, Receiver<String>) = unbounded();
-    let (result_tx, result_rx): (Sender<QueryResponse>, Receiver<QueryResponse>) = unbounded();
-    let tantivy_query_tx = query_tx.clone();
-    let tantivy_thread = thread::Builder::new()
-        .name("tantivy".to_string())
-        .spawn(move || start_tantivy((tantivy_query_tx, query_rx), result_tx));
+    let config = get_config();
 
-    let app_state = web::Data::new(AppState {
-        query_sender: query_tx.clone(),
-        result_receiver: result_rx.clone(),
+    setup_global_subscriber(&config);
+
+    let local = tokio::task::LocalSet::new();
+
+    // Get or create settings
+    let settings = get_or_create_settings(&config);
+
+    let (searcher, mut tantivy_wrapper) = tantivy_init(&settings).unwrap();
+
+    let _tantivy_thread = tokio::spawn(async move {
+        start_tantivy(&settings, &mut tantivy_wrapper)
+            .await
+            .unwrap();
     });
 
-    HttpServer::new(move || {
+    let sys = actix_rt::System::run_in_tokio("server", &local);
+
+    let app_state = web::Data::new(AppState { searcher: searcher });
+
+    let server_res = HttpServer::new(move || {
         App::new()
             .wrap(
                 Cors::new() // <- Construct CORS middleware builder
@@ -38,13 +51,43 @@ async fn main() -> io::Result<()> {
                     .finish(),
             )
             .app_data(app_state.clone())
-            .configure(search::config)
+            .configure(search::server_config)
     })
-    .bind("127.0.0.1:8080")?
+    .bind(format!("127.0.0.1:{}", config.port))?
     .run()
-    .await
+    .await?;
+
+    sys.await?;
+
+    Ok(server_res)
 
     // if tantivy_thread.unwrap().join().is_err() {
     //     error!("Failed to join tantivy thread");
     // }
+}
+
+fn get_or_create_settings(app_config: &AppConfig) -> TantivyConfig {
+    let index_path = app_dir(AppDataType::UserData, &APP_INFO, "index").unwrap();
+    info!("Using index file in: {:?}", index_path);
+
+    let state_path = app_dir(AppDataType::UserData, &APP_INFO, "state").unwrap();
+    let mut initial_processing_file = state_path.clone();
+    initial_processing_file.push("initial_processing");
+
+    TantivyConfig {
+        index_path: index_path,
+        scan_directories: app_config.scan_directories.clone(),
+        initial_processing_file: initial_processing_file,
+    }
+}
+
+fn setup_global_subscriber(config: &AppConfig) -> impl Drop {
+    let (flame_layer, _guard) = FlameLayer::with_file("./tracing.folded").unwrap();
+    let t = tracing_subscriber::fmt()
+        .with_max_level(config.verbosity.clone())
+        .finish()
+        .with(flame_layer)
+        .try_init();
+
+    _guard
 }

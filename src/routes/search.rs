@@ -1,7 +1,8 @@
-use crate::contracts::AppState::*;
+use crate::contracts::app_state::*;
 use actix_web::{web, HttpRequest, HttpResponse};
+use tracing::{info, span, Level};
 
-pub fn config(cfg: &mut web::ServiceConfig) {
+pub fn server_config(cfg: &mut web::ServiceConfig) {
     cfg.route("/search/{query}", web::get().to(index));
 }
 
@@ -11,25 +12,9 @@ async fn index(app_state: web::Data<AppState>, req: HttpRequest) -> HttpResponse
     let query: String = req.match_info().query("query").parse().unwrap();
     println!("{:?}", query);
 
-    println!("Getting query channel");
-    let query_channel = &app_state.query_sender;
+    let response = span!(Level::INFO, "search_query").in_scope(|| app_state.searcher.search(query));
 
-    println!("Sending from query channel");
-    if let Err(err) = query_channel.send(query) {
-        println!("{:?}", err);
-    }
-
-    println!("Getting response channel");
-    let resp = &app_state.result_receiver;
-
-    println!("Getting from response channel");
-    let result = match resp.recv() {
-        Err(err) => format!("Err: {:?}", err),
-        Ok(r) => {
-            println!("Ok!: {:?}", r);
-            serde_json::to_string(&r).unwrap()
-        }
-    };
+    let result = serde_json::to_string(&response).unwrap();
 
     info!("Found results: {:?}", &result);
 

@@ -1,86 +1,41 @@
-use crate::contracts::file_to_process::FileToProcess;
+use crate::contracts::file_to_process::new_file_to_process;
+use crate::custom_tantivy::{utils::build_schema, wrapper::*};
 use crate::file_watcher::*;
-use crate::query_executor::*;
-use crate::tantivy_api::*;
+use crate::indexers::Analyzer;
+use crate::searcher::Searcher;
 
-use app_dirs::*;
-use config::*;
-use crossbeam::channel::unbounded;
-use crossbeam::channel::{Receiver, Sender};
 use tantivy::directory::*;
-use tantivy::{Index, ReloadPolicy, Term};
+use tantivy::{Index, ReloadPolicy};
+use tracing::{info, span, Level};
 use walkdir::WalkDir;
 
-use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
-use std::thread;
+use std::path::PathBuf;
 
-const APP_INFO: AppInfo = AppInfo {
-    name: "Podium",
-    author: "Teodor Voinea",
-};
+pub struct TantivyConfig {
+    pub scan_directories: Vec<PathBuf>,
+    pub initial_processing_file: PathBuf,
+    pub index_path: PathBuf,
+}
 
-/// Starts tantivy thread
-/// Starts file watcher thread
-/// Does initial file processing
-/// Starts reader thread
-/// Owns tantivy's index_writer so it's able to write/delete documents
-/// TODO: This function does too much? Should break it up
-pub fn start_tantivy(
-    query_channel: (Sender<String>, Receiver<String>),
-    result_tx: Sender<QueryResponse>,
+/// Starts watching directories
+/// Does initial processing
+/// Consumes watcher events to continue processing files
+pub async fn start_tantivy(
+    settings: &TantivyConfig,
+    tantivy_wrapper: &mut TantivyWrapper,
 ) -> tantivy::Result<()> {
-    let index_path = app_dir(AppDataType::UserData, &APP_INFO, "index").unwrap();
-    info!("Using index file in: {:?}", index_path);
-
-    let state_path = app_dir(AppDataType::UserData, &APP_INFO, "state").unwrap();
-    let mut initial_processing_file = state_path.clone();
-    initial_processing_file.push("initial_processing");
-
-    let config_path = app_dir(AppDataType::UserConfig, &APP_INFO, "config").unwrap();
-    let mut config_file = config_path.clone();
-    config_file.push("config");
-    config_file.set_extension("json");
-
-    if !config_file.as_path().exists() {
-        info!("Config file not found, copying default config");
-        let default_config_path = Path::new("debug_default_config.json");
-        fs::copy(default_config_path, &config_file).unwrap();
-    }
-
-    info!("Loading config file from: {:?}", config_file);
-    let mut settings = Config::default();
-    settings.merge(File::from(config_file)).unwrap();
-    let settings_dict = settings.try_into::<HashMap<String, Vec<String>>>().unwrap();
-    let directories = settings_dict.get("directories").unwrap();
-
-    let schema = build_schema();
-
-    let index = Index::open_or_create(MmapDirectory::open(&index_path).unwrap(), schema.clone())?;
-
-    let reader = index
-        .reader_builder()
-        .reload_policy(ReloadPolicy::OnCommit)
-        .try_into()?;
-
+    let directories = &settings.scan_directories;
     let directories_clone = directories.clone();
 
-    let (index_writer_tx, index_writer_rx) = unbounded();
+    let initial_processing_done = settings.initial_processing_file.exists();
 
-    let watcher_index_writer = index_writer_tx.clone();
+    let analyzer = Analyzer::default();
 
-    let watcher_schema = schema.clone();
-
-    let watcher_reader = index
-        .reader_builder()
-        .reload_policy(ReloadPolicy::OnCommit)
-        .try_into()?;
-
-    let mut index_writer = index.writer(50_000_000)?;
-
-    if !initial_processing_file.exists() {
+    if !initial_processing_done {
         info!("Initial processing was not previously done, doing now");
+        let initial_processing_span = span!(Level::INFO, "initial_processing");
+        let _initial_processing_entry = initial_processing_span.enter();
         for directory in directories {
             let walker = WalkDir::new(directory).into_iter();
             for entry in walker.filter_entry(|e| !is_hidden(e)) {
@@ -92,82 +47,55 @@ pub fn start_tantivy(
                     _ => {}
                 }
                 let entry = entry.unwrap();
+                let entry_path = entry.path().to_str().unwrap();
+                let process_file_span = span!(Level::INFO, "processing_file", entry_path);
+                let _process_file_entry = process_file_span.enter();
                 if !entry.file_type().is_dir() {
                     let entry_path = entry.path();
-                    let file_hash = if let Ok(f_h) = get_file_hash(entry_path) {
-                        f_h
-                    } else {
-                        continue;
-                    };
 
-                    let file_to_process = FileToProcess {
-                        path: entry_path.to_path_buf(),
-                        hash: file_hash,
-                        contents: Vec::new(),
-                    };
+                    match entry_path.extension() {
+                        None => continue,
+                        Some(extension) => {
+                            if !analyzer.supported_extensions.contains(extension) {
+                                continue;
+                            }
+                        }
+                    }
 
-                    // Check if this file has been processed before at a different location
-                    if let Some(doc_to_update) =
-                        update_existing_file(&file_to_process, &schema, &reader)
-                    {
-                        // If it has, add this current location to the document
-                        let (_title, hash_field, _location, _body) = destructure_schema(&schema);
-                        // Delete the old document
-                        let hash_term =
-                            Term::from_field_text(hash_field, file_hash.to_hex().as_str());
-                        info!("Deleting the old document");
-                        index_writer.delete_term(hash_term);
-                        info!("Adding the new document");
-                        index_writer.add_document(doc_to_update);
-                    }
-                    // We might not need to add anything if the file already exists
-                    else if let Some(doc_to_add) =
-                        process_file(&file_to_process, &schema, &reader)
-                    {
-                        index_writer.add_document(doc_to_add);
-                    }
+                    let file_to_process = new_file_to_process(entry_path).await;
+
+                    tantivy_wrapper.process_file(file_to_process).await;
+                    tantivy_wrapper.index_writer.commit()?;
                 }
             }
         }
-        index_writer.commit()?;
-        // After we finished doing the initial processing, add the file so that we know for next time
-        fs::File::create(initial_processing_file).unwrap();
+        fs::File::create(&settings.initial_processing_file).unwrap();
     } else {
         info!("Initial processing already done! Starting a reader");
     }
 
-    let _watcher_thread = thread::Builder::new()
-        .name("file_watcher_thread".to_string())
-        .spawn(|| {
-            start_watcher(
-                directories_clone,
-                watcher_index_writer,
-                watcher_schema,
-                watcher_reader,
-            )
-        });
-
-    let reader_schema = schema.clone();
-
-    let (_reader_tx, reader_rx) = query_channel;
-
-    let _reader_thread = thread::Builder::new()
-        .name("tantivy_reader".to_string())
-        .spawn(move || start_reader(index, reader, reader_rx, &reader_schema, result_tx));
-
-    for writer_action in index_writer_rx.iter() {
-        match writer_action {
-            WriterAction::Add(document_to_write) => {
-                index_writer.add_document(document_to_write);
-                // TODO: be smarter about when we commit
-                index_writer.commit()?;
-            }
-            WriterAction::Delete(hash_term) => {
-                index_writer.delete_term(hash_term);
-                index_writer.commit()?;
-            }
-        }
-    }
+    start_watcher(&directories_clone, tantivy_wrapper).await;
 
     Ok(())
+}
+
+pub fn tantivy_init(settings: &TantivyConfig) -> tantivy::Result<(Searcher, TantivyWrapper)> {
+    let index_path = &settings.index_path;
+
+    let schema = build_schema();
+
+    let index = Index::open_or_create(MmapDirectory::open(&index_path).unwrap(), schema.clone())?;
+
+    let index_reader = index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::OnCommit)
+        .try_into()?;
+
+    let index_writer = index.writer(50_000_000)?;
+
+    let searcher = Searcher::new(index, index_reader.clone(), schema.clone());
+
+    let tantivy_wrapper = TantivyWrapper::new(index_reader, index_writer, schema);
+
+    Ok((searcher, tantivy_wrapper))
 }

@@ -2,12 +2,13 @@ use super::DocumentSchema;
 use super::Indexer;
 use crate::contracts::file_to_process::FileToProcess;
 use crate::error_adapter::log_and_return_error_string;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::Cursor;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Error, Result};
 use exif::{Rational, Tag, Value};
-use reverse_geocoder::{Locations, ReverseGeocoder};
+use reverse_geocoder::{Locations, Record, ReverseGeocoder};
+use tracing::{span, Level};
 
 lazy_static! {
     static ref LOCATIONS: Locations = Locations::from_memory();
@@ -24,60 +25,82 @@ impl Indexer for ExifIndexer {
             || extension == OsStr::new("jpeg")
     }
 
+    fn supported_extensions(&self) -> Vec<OsString> {
+        vec![
+            OsString::from("tif"),
+            OsString::from("tifd"),
+            OsString::from("jpg"),
+            OsString::from("jpeg"),
+        ]
+    }
+
     fn index_file(&self, file_to_process: &FileToProcess) -> Result<DocumentSchema> {
-        let reader =
-            exif::Reader::new(&mut Cursor::new(&file_to_process.contents)).with_context(|| {
-                log_and_return_error_string(format!(
-                    "exif_indexer: Failed to initialize exif reader for file at path: {:?}",
-                    file_to_process.path
-                ))
+        let path = file_to_process.path.to_str().unwrap();
+        span!(Level::INFO, "exif_indexer: indexing image file", path).in_scope(|| {
+            let reader = span!(Level::INFO, "exif_indexer: Loading exif data from image from memory").in_scope(|| {
+                exif::Reader::new(&mut Cursor::new(&file_to_process.contents)).with_context(|| {
+                    log_and_return_error_string(format!(
+                        "exif_indexer: Failed to initialize exif reader for file at path: {:?}",
+                        file_to_process.path
+                    ))
+                })
             })?;
-        let mut lat_direction = 0_u8 as char;
-        let mut lat = 0.0;
-        let mut lon_direction = 0_u8 as char;
-        let mut lon = 0.0;
-        for f in reader.fields() {
-            match f.tag {
-                Tag::GPSLatitudeRef => {
-                    if let Value::Ascii(val) = &f.value {
-                        lat_direction = val[0][0] as char;
-                    }
-                }
-                Tag::GPSLatitude => {
-                    if let Value::Rational(val) = &f.value {
-                        lat = value_to_deg(val);
-                    }
-                }
-                Tag::GPSLongitudeRef => {
-                    if let Value::Ascii(val) = &f.value {
-                        lon_direction = val[0][0] as char;
-                    }
-                }
-                Tag::GPSLongitude => {
-                    if let Value::Rational(val) = &f.value {
-                        lon = value_to_deg(val);
-                    }
-                }
-                _ => {}
-            }
-        }
 
-        if lat_direction != 'N' {
-            lat *= -1.0;
-        }
+            let mut lat = 0.0;
+            let mut lon = 0.0;
 
-        if lon_direction != 'E' {
-            lon *= -1.0;
-        }
+            span!(Level::INFO, "exif_indexer: Processing exif fields").in_scope(|| {
+                let mut lat_direction = 0_u8 as char;
+                let mut lon_direction = 0_u8 as char;
+                for f in reader.fields() {
+                    match f.tag {
+                        Tag::GPSLatitudeRef => {
+                            if let Value::Ascii(val) = &f.value {
+                                lat_direction = val[0][0] as char;
+                            }
+                        }
+                        Tag::GPSLatitude => {
+                            if let Value::Rational(val) = &f.value {
+                                lat = value_to_deg(val);
+                            }
+                        }
+                        Tag::GPSLongitudeRef => {
+                            if let Value::Ascii(val) = &f.value {
+                                lon_direction = val[0][0] as char;
+                            }
+                        }
+                        Tag::GPSLongitude => {
+                            if let Value::Rational(val) = &f.value {
+                                lon = value_to_deg(val);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
 
-        let res = GEOCODER.search(&[lat, lon])
-            .with_context(|| log_and_return_error_string(format!("exif_indexer: Failed to search for location in geocoder: lat = {:?} lon = {:?}", lat, lon)))?
-            .get(0)
-            .with_context(|| log_and_return_error_string(format!("exif_indexer: Failed to get first result from search in geocoder")))?
-            .1;
-        Ok(DocumentSchema {
-            name: String::new(),
-            body: format!("{} {} {} {}", res.name, res.admin1, res.admin2, res.admin3),
+                if lat_direction != 'N' {
+                    lat *= -1.0;
+                }
+
+                if lon_direction != 'E' {
+                    lon *= -1.0;
+                }
+            });
+
+            let res = span!(Level::INFO, "exif_indexer: Look up the coordinates").in_scope(|| -> Result<&&Record, Error>{
+                Ok(
+                    GEOCODER.search(&[lat, lon])
+                        .with_context(|| log_and_return_error_string(format!("exif_indexer: Failed to search for location in geocoder: lat = {:?} lon = {:?}", lat, lon)))?
+                        .get(0)
+                        .with_context(|| log_and_return_error_string(format!("exif_indexer: Failed to get first result from search in geocoder")))?
+                        .1
+                )
+            })?;
+
+            Ok(DocumentSchema {
+                name: String::new(),
+                body: format!("{} {} {} {}", res.name, res.admin1, res.admin2, res.admin3),
+            })
         })
     }
 }
@@ -93,13 +116,14 @@ fn def_to_dec_dec(deg: f64, min: f64, sec: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contracts::file_to_process::new_file_to_process;
     use std::path::Path;
 
-    #[test]
-    fn test_indexing_text_file() {
+    #[tokio::test(core_threads = 1)]
+    async fn test_indexing_text_file() {
         let test_file_path = Path::new("./test_files/IMG_2551.jpeg");
         let indexed_document = ExifIndexer
-            .index_file(&FileToProcess::from(test_file_path))
+            .index_file(&new_file_to_process(test_file_path).await)
             .unwrap();
 
         assert_eq!(indexed_document.name, "");

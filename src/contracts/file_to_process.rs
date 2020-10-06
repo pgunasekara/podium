@@ -1,7 +1,8 @@
-use crate::tantivy_api::*;
-use std::fs::File;
-use std::io::Read;
+use crate::custom_tantivy::utils::calculate_hash;
+use std::fmt::Debug;
 use std::path::{Path, PathBuf};
+use tokio::fs;
+use tracing::{info_span, instrument};
 
 #[derive(Debug, Clone)]
 pub struct FileToProcess {
@@ -10,31 +11,24 @@ pub struct FileToProcess {
     pub contents: Vec<u8>,
 }
 
-impl From<&Path> for FileToProcess {
-    fn from(path: &Path) -> Self {
-        let mut contents = Vec::new();
-        let mut file = File::open(path).unwrap();
-        file.read_to_end(&mut contents).unwrap();
-
-        FileToProcess {
-            path: path.to_path_buf(),
-            hash: get_file_hash(path).unwrap(),
-            contents: contents,
-        }
+impl FileToProcess {
+    pub fn path(&self) -> String {
+        self.path.to_string_lossy().to_string()
     }
 }
 
-impl From<PathBuf> for FileToProcess {
-    fn from(path: PathBuf) -> Self {
-        let hash = get_file_hash(&path).unwrap();
-        let mut contents = Vec::new();
-        let mut file = File::open(&path).unwrap();
-        file.read_to_end(&mut contents).unwrap();
+#[instrument]
+pub async fn new_file_to_process<T: AsRef<Path> + Debug>(path: T) -> FileToProcess {
+    let contents = fs::read(&path).await.unwrap();
 
-        FileToProcess {
-            path: path,
-            hash: hash,
-            contents: contents,
-        }
+    let span = info_span!("calculating hash");
+    let _enter = span.enter();
+    let hash = calculate_hash(&contents);
+    drop(_enter);
+
+    FileToProcess {
+        path: PathBuf::from(path.as_ref()),
+        hash: hash,
+        contents: contents,
     }
 }
